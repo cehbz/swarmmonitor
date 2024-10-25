@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/cehbz/qbittorrent"
+	_ "github.com/lib/pq" // PostgreSQL driver
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	_ "modernc.org/sqlite" // instead of github.com/mattn/go-sqlite3
 )
 
 type TorrentNotification struct {
@@ -27,45 +27,50 @@ type TorrentNotification struct {
 var newTorrentChan chan TorrentNotification
 
 var (
-	socketPath   string = "/tmp/swarmmonitor.sock"
+	socketPath   string = fmt.Sprintf("/run/user/%d/swarmmonitor.sock", os.Getuid())
 	qBitAddr     string = "127.0.0.1"
 	qBitPort     string = "8080"
 	qBitUsername string = "admin"
 	qBitPassword string = "adminpass"
+	pgSocketDir  string = "/var/run/postgresql" // Default Unix socket directory for PostgreSQL
+	pgDatabase   string = "swarmmonitor"
+	pgUser       string = "postgres"
+	pgPassword   string = "postgrespass"
 	configPath   string = os.Getenv("HOME") + "/.config/swarmmonitor/config.toml"
 )
 
 var rootCmd *cobra.Command
 
 func initDB() *sql.DB {
-	var err error
-	db, err := sql.Open("sqlite", "./torrents.db")
+	connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s sslmode=disable",
+		pgUser, pgPassword, pgDatabase, pgSocketDir)
+	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS torrents (
-		id INTEGER PRIMARY KEY,
+		id SERIAL PRIMARY KEY,
 		name TEXT NOT NULL,
 		hash TEXT NOT NULL UNIQUE
 	);
 
 	CREATE TABLE IF NOT EXISTS peers (
-		id INTEGER PRIMARY KEY,
+		id SERIAL PRIMARY KEY,
 		ip TEXT NOT NULL,
 		port INTEGER NOT NULL,
 		country_code TEXT,
 		client TEXT,
-		UNIQUE(ip, port)  -- prevent duplicate peer entries
+		UNIQUE(ip, port)
 	);
 
 	CREATE TABLE IF NOT EXISTS peer_metrics (
 		timestamp TIMESTAMP NOT NULL,
 		peer_id INTEGER NOT NULL,
 		torrent_id INTEGER NOT NULL,
-		uploaded INTEGER NOT NULL,
-		downloaded INTEGER NOT NULL,
+		uploaded BIGINT NOT NULL,
+		downloaded BIGINT NOT NULL,
 		pct_complete REAL NOT NULL,
 		FOREIGN KEY (peer_id) REFERENCES peers(id),
 		FOREIGN KEY (torrent_id) REFERENCES torrents(id)
@@ -74,8 +79,8 @@ func initDB() *sql.DB {
 	CREATE TABLE IF NOT EXISTS main_metrics (
 		timestamp TIMESTAMP NOT NULL,
 		torrent_id INTEGER NOT NULL,
-		uploaded INTEGER NOT NULL,
-		downloaded INTEGER NOT NULL,
+		uploaded BIGINT NOT NULL,
+		downloaded BIGINT NOT NULL,
 		FOREIGN KEY (torrent_id) REFERENCES torrents(id)
 	);
 	`
@@ -403,6 +408,10 @@ func main() {
 	rootCmd.Flags().StringVar(&qBitPort, "qbit-port", "", "qBittorrent webui port")
 	rootCmd.Flags().StringVar(&qBitUsername, "qbit-username", "", "qBittorrent username")
 	rootCmd.Flags().StringVar(&qBitPassword, "qbit-password", "", "qBittorrent password")
+	rootCmd.Flags().StringVar(&pgSocketDir, "pg-socket-dir", "", "PostgreSQL Unix socket directory")
+	rootCmd.Flags().StringVar(&pgDatabase, "pg-database", "", "PostgreSQL database name")
+	rootCmd.Flags().StringVar(&pgUser, "pg-user", "", "PostgreSQL user")
+	rootCmd.Flags().StringVar(&pgPassword, "pg-password", "", "PostgreSQL password")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("Error executing rootCmd: %v", err)
@@ -424,6 +433,10 @@ func loadConfig(configPath string) {
 		"qbit-port":     &qBitPort,
 		"qbit-username": &qBitUsername,
 		"qbit-password": &qBitPassword,
+		"pg-socket-dir": &pgSocketDir,
+		"pg-database":   &pgDatabase,
+		"pg-user":       &pgUser,
+		"pg-password":   &pgPassword,
 	}
 
 	for flag, ptr := range flags {
