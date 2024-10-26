@@ -32,7 +32,8 @@ var (
 	qBitPort     string = "8080"
 	qBitUsername string = "admin"
 	qBitPassword string = "adminpass"
-	pgSocketDir  string = "/var/run/postgresql" // Default Unix socket directory for PostgreSQL
+	pgSocketDir  string = "/var/run/postgresql"
+	pgPort       string = "5432"
 	pgDatabase   string = "swarmmonitor"
 	pgUser       string = "postgres"
 	pgPassword   string = "postgrespass"
@@ -42,8 +43,9 @@ var (
 var rootCmd *cobra.Command
 
 func initDB() *sql.DB {
-	connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s sslmode=disable",
-		pgUser, pgPassword, pgDatabase, pgSocketDir)
+	connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable",
+		pgUser, pgPassword, pgDatabase, pgSocketDir, pgPort)
+
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
@@ -98,7 +100,7 @@ func monitorTorrent(name, hash string, client *qbittorrent.Client, ctx context.C
 	var torrentID int
 	err := db.QueryRow(`
 		INSERT INTO torrents (name, hash)
-		VALUES (?, ?)
+		VALUES ($1, $2)
 		ON CONFLICT(hash)
 		DO UPDATE SET name = excluded.name
 		RETURNING id
@@ -152,7 +154,7 @@ func monitorTorrent(name, hash string, client *qbittorrent.Client, ctx context.C
 					var peerID int
 					err := tx.QueryRow(`
 								INSERT INTO peers (ip, port, client)
-								VALUES (?, ?, ?)
+								VALUES ($1, $2, $3)
 								ON CONFLICT(ip, port)
 								DO UPDATE SET client = excluded.client
 								RETURNING id
@@ -171,7 +173,7 @@ func monitorTorrent(name, hash string, client *qbittorrent.Client, ctx context.C
 						downloaded = 0
 					}
 					_, err = tx.Exec(`INSERT INTO peer_metrics (timestamp, peer_id, torrent_id, uploaded, downloaded, pct_complete)
-					VALUES (?, ?, ?, ?, ?, ?)`,
+					VALUES ($1, $2, $3, $4, $5, $6)`,
 						ts.Format(time.RFC3339), peerID, torrentID, uploaded, downloaded, peer.Progress)
 					if err != nil {
 						log.Printf("Error inserting peer metrics: %v", err)
@@ -225,13 +227,15 @@ func periodicCheck(client *qbittorrent.Client, ctx context.Context, db *sql.DB, 
 		// Insert torrents into the torrents table and remember their ids
 		for hash, torrent := range mainData.Torrents {
 			var id int
-			err = tx.QueryRow(`INSERT INTO torrents (hash, name) VALUES (?, ?)
-				ON CONFLICT(hash) DO UPDATE SET name = excluded.name
-				RETURNING id`,
-				hash, torrent.Name).Scan(&id)
+			err = tx.QueryRow(`
+				INSERT INTO torrents (hash, name)
+				VALUES ($1, $2)
+				ON CONFLICT (hash)
+				DO UPDATE SET name = excluded.name
+				RETURNING id
+			`, hash, torrent.Name).Scan(&id)
 			if err != nil {
-				log.Printf("Error inserting torrent %s: %v", hash, err)
-				continue
+				log.Fatalf("Error inserting torrent %s: %v", hash, err)
 			}
 			hash_ids[hash] = id
 			lastUploaded[hash] = torrent.Uploaded
@@ -282,7 +286,7 @@ func periodicCheck(client *qbittorrent.Client, ctx context.Context, db *sql.DB, 
 						}
 						ts := time.Now().UTC()
 						_, err := tx.Exec(`INSERT INTO main_metrics (timestamp, torrent_id, uploaded, downloaded)
-							VALUES (?, ?, ?, ?)`,
+							VALUES ($1, $2, $3, $4)`,
 							ts.Format(time.RFC3339), hash_ids[hash], uploaded, downloaded)
 						if err != nil {
 							log.Printf("Error inserting main metrics (%s): %v", hash, err)
@@ -334,8 +338,6 @@ func run(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to listen on socket: %v", err)
 	}
 	defer listener.Close()
-
-	log.Printf("Listening on socket: %s", socketPath)
 
 	// Handle interrupt signals for graceful shutdown
 	interrupt := make(chan os.Signal, 1)
@@ -402,21 +404,27 @@ func main() {
 		Run:   run,
 	}
 
-	rootCmd.Flags().StringVarP(&configPath, "config", "c", configPath, "Path to config file")
-	rootCmd.Flags().StringVar(&socketPath, "socket", "", "Unix socket path")
-	rootCmd.Flags().StringVar(&qBitAddr, "qbit-addr", "", "qBittorrent host")
-	rootCmd.Flags().StringVar(&qBitPort, "qbit-port", "", "qBittorrent webui port")
-	rootCmd.Flags().StringVar(&qBitUsername, "qbit-username", "", "qBittorrent username")
-	rootCmd.Flags().StringVar(&qBitPassword, "qbit-password", "", "qBittorrent password")
-	rootCmd.Flags().StringVar(&pgSocketDir, "pg-socket-dir", "", "PostgreSQL Unix socket directory")
-	rootCmd.Flags().StringVar(&pgDatabase, "pg-database", "", "PostgreSQL database name")
-	rootCmd.Flags().StringVar(&pgUser, "pg-user", "", "PostgreSQL user")
-	rootCmd.Flags().StringVar(&pgPassword, "pg-password", "", "PostgreSQL password")
+	// Define flags with literal defaults
+	rootCmd.Flags().StringVarP(&configPath, "config", "c", os.Getenv("HOME")+"/.config/swarmmonitor/config.toml", "Path to config file")
+	rootCmd.Flags().StringVar(&socketPath, "socket", fmt.Sprintf("/run/user/%d/swarmmonitor.sock", os.Getuid()), "Unix socket path")
+	rootCmd.Flags().StringVar(&qBitAddr, "qbit-addr", "127.0.0.1", "qBittorrent host")
+	rootCmd.Flags().StringVar(&qBitPort, "qbit-port", "8080", "qBittorrent webui port")
+	rootCmd.Flags().StringVar(&qBitUsername, "qbit-username", "admin", "qBittorrent username")
+	rootCmd.Flags().StringVar(&qBitPassword, "qbit-password", "adminpass", "qBittorrent password")
+	rootCmd.Flags().StringVar(&pgSocketDir, "pg-socket-dir", "/var/run/postgresql", "PostgreSQL Unix socket directory")
+	rootCmd.Flags().StringVar(&pgPort, "pg-port", "5432", "PostgreSQL port")
+	rootCmd.Flags().StringVar(&pgDatabase, "pg-database", "swarmmonitor", "PostgreSQL database name")
+	rootCmd.Flags().StringVar(&pgUser, "pg-user", "postgres", "PostgreSQL user")
+	rootCmd.Flags().StringVar(&pgPassword, "pg-password", "postgrespass", "PostgreSQL password")
 
+	// Parse flags
 	if err := rootCmd.Execute(); err != nil {
 		log.Printf("Error executing rootCmd: %v", err)
 		os.Exit(1)
 	}
+
+	// Now load config and only override values that weren't explicitly set via flags
+	loadConfig(configPath)
 }
 
 func loadConfig(configPath string) {
@@ -425,8 +433,8 @@ func loadConfig(configPath string) {
 		log.Printf("No config file found or error reading config file: %v\n", err)
 		return
 	}
-	log.Printf("Using config file: %s\n", viper.ConfigFileUsed())
 
+	// Only update values that are still set to their flag defaults
 	flags := map[string]*string{
 		"socket":        &socketPath,
 		"qbit-addr":     &qBitAddr,
@@ -434,17 +442,17 @@ func loadConfig(configPath string) {
 		"qbit-username": &qBitUsername,
 		"qbit-password": &qBitPassword,
 		"pg-socket-dir": &pgSocketDir,
+		"pg-port":       &pgPort,
 		"pg-database":   &pgDatabase,
 		"pg-user":       &pgUser,
 		"pg-password":   &pgPassword,
 	}
 
 	for flag, ptr := range flags {
-		if rootCmd.Flags().Changed(flag) {
-			continue
-		}
-		if v := viper.GetString(flag); v != "" {
-			*ptr = v
+		if !rootCmd.Flags().Changed(flag) {
+			if v := viper.GetString(flag); v != "" {
+				*ptr = v
+			}
 		}
 	}
 }
