@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,17 +30,18 @@ type TorrentNotification struct {
 var newTorrentChan chan TorrentNotification
 
 var (
-	socketPath   string = fmt.Sprintf("/run/user/%d/swarmmonitor.sock", os.Getuid())
-	qBitAddr     string = "127.0.0.1"
-	qBitPort     string = "8080"
-	qBitUsername string = "admin"
-	qBitPassword string = "adminpass"
-	pgSocketDir  string = "/var/run/postgresql"
-	pgPort       string = "5432"
-	pgDatabase   string = "swarmmonitor"
-	pgUser       string = "postgres"
-	pgPassword   string = "postgrespass"
-	configPath   string = os.Getenv("HOME") + "/.config/swarmmonitor/config.toml"
+	socketPath     string = fmt.Sprintf("/run/user/%d/swarmmonitor.sock", os.Getuid())
+	qBitAddr       string = "127.0.0.1"
+	qBitPort       string = "8080"
+	qBitUsername   string = "admin"
+	qBitPassword   string = "adminpass"
+	pgSocketDir    string = "/var/run/postgresql"
+	pgPort         string = "5432"
+	pgDatabase     string = "swarmmonitor"
+	pgUser         string = "postgres"
+	pgPassword     string = "postgrespass"
+	configPath     string = os.Getenv("HOME") + "/.config/swarmmonitor/config.toml"
+	activeMonitors sync.Map
 )
 
 var rootCmd *cobra.Command
@@ -95,11 +98,13 @@ func initDB() *sql.DB {
 }
 
 func monitorTorrent(hash, _ /* tracker */, name string, client *qbittorrent.Client, ctx context.Context, db *sql.DB) {
+	defer activeMonitors.Delete(hash)
+
 	var torrentID int
 	if err := db.QueryRow(`
 		INSERT INTO torrents (hash, name)
 		VALUES ($1, $2)
-		ON CONFLICT(hash) DO UPDATE SET name = excluded.name
+			ON CONFLICT(hash) DO UPDATE SET name = excluded.name
 		RETURNING id`, hash, name).Scan(&torrentID); err != nil {
 		log.Printf("Error inserting or getting torrent ID: %v", err)
 		return
@@ -408,9 +413,23 @@ func handleConnection(ctx context.Context, conn net.Conn, qbClient *qbittorrent.
 	}
 
 	hash := fields[0]
+	if _, exists := activeMonitors.Load(hash); exists {
+		log.Printf("Already monitoring: %s, ignoring.", hash)
+		return
+	}
+	activeMonitors.Store(hash, struct{}{})
+
 	tracker := fields[1]
+	if u, err := url.Parse(tracker); err == nil && u.Host != "" {
+		if parts := strings.Split(u.Host, "."); len(parts) >= 2 {
+			tracker = strings.Join(parts[len(parts)-2:], ".")
+		} else {
+			tracker = u.Host
+		}
+	}
 	name := fields[2]
-	log.Printf("Received hash: %s, tracker: %s, name: %s", hash, tracker, name)
+
+	log.Printf("Monitoring: %s, tracker: %s, name: %s", hash, tracker, name)
 
 	go monitorTorrent(hash, tracker, name, qbClient, ctx, db)
 }
