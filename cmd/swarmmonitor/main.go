@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -93,104 +94,102 @@ func initDB() *sql.DB {
 	return db
 }
 
-func monitorTorrent(name, hash string, client *qbittorrent.Client, ctx context.Context, db *sql.DB) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
+func monitorTorrent(hash, _ /* tracker */, name string, client *qbittorrent.Client, ctx context.Context, db *sql.DB) {
 	var torrentID int
-	err := db.QueryRow(`
-		INSERT INTO torrents (name, hash)
+	if err := db.QueryRow(`
+		INSERT INTO torrents (hash, name)
 		VALUES ($1, $2)
-		ON CONFLICT(hash)
-		DO UPDATE SET name = excluded.name
-		RETURNING id
-	`, name, hash).Scan(&torrentID)
-	if err != nil {
+		ON CONFLICT(hash) DO UPDATE SET name = excluded.name
+		RETURNING id`, hash, name).Scan(&torrentID); err != nil {
 		log.Printf("Error inserting or getting torrent ID: %v", err)
 		return
 	}
 
-	// Send notification about the new torrent
 	select {
 	case newTorrentChan <- TorrentNotification{Hash: hash, ID: torrentID}:
 	default:
 		log.Printf("Warning: newTorrentChan is full, couldn't notify about new torrent %s", hash)
 	}
 
-	lastRid := 0
+	// First phase: every second for 10 minutes
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	phase2 := time.After(10 * time.Minute)
+	done := time.After(30 * time.Minute)
+
+	rid := 0
 	lastUploaded := make(map[int]int64)
 	lastDownloaded := make(map[int]int64)
+
 	for {
 		select {
 		case <-ticker.C:
-			peers, err := client.SyncTorrentPeers(hash, lastRid)
-			if err != nil {
-				log.Printf("Error getting peer info for hash %s: %v", hash, err)
-				continue
+			if err := updatePeerMetrics(client, db, hash, torrentID, &rid, lastUploaded, lastDownloaded); err != nil {
+				log.Printf("Error updating peer metrics: %v", err)
 			}
-			lastRid = peers.Rid
 
-			func() {
-				tx, err := db.Begin()
-				if err != nil {
-					log.Printf("Error starting transaction: %v", err)
-					return
-				}
-				defer func() {
-					if p := recover(); p != nil {
-						tx.Rollback()
-						panic(p)
-					} else if err != nil {
-						tx.Rollback()
-					} else {
-						err = tx.Commit()
-						if err != nil {
-							log.Printf("Error committing transaction: %v", err)
-						}
-					}
-				}()
+		case <-phase2:
+			ticker.Reset(5 * time.Second)
 
-				for _, peer := range peers.Peers {
-					var peerID int
-					err := tx.QueryRow(`
-								INSERT INTO peers (ip, port, client)
-								VALUES ($1, $2, $3)
-								ON CONFLICT(ip, port)
-								DO UPDATE SET client = excluded.client
-								RETURNING id
-							`, peer.IP, peer.Port, peer.Client).Scan(&peerID)
-					if err != nil {
-						log.Printf("Error inserting or getting peer ID: %v", err)
-						continue
-					}
-					ts := time.Now().UTC()
-					uploaded := peer.Uploaded - lastUploaded[peerID]
-					if uploaded < 0 {
-						uploaded = 0
-					}
-					downloaded := peer.Downloaded - lastDownloaded[peerID]
-					if downloaded < 0 {
-						downloaded = 0
-					}
-					_, err = tx.Exec(`INSERT INTO peer_metrics (timestamp, peer_id, torrent_id, uploaded, downloaded, pct_complete)
-					VALUES ($1, $2, $3, $4, $5, $6)`,
-						ts.Format(time.RFC3339), peerID, torrentID, uploaded, downloaded, peer.Progress)
-					if err != nil {
-						log.Printf("Error inserting peer metrics: %v", err)
-						continue
-					}
+		case <-done:
+			log.Printf("Monitoring complete for hash: %s", hash)
+			return
 
-					fmt.Printf("%s peer_metrics %40s,%15s:%-5d: %20s %5.3f %12d %12d\n",
-						ts.Format(time.Stamp), hash, peer.IP, peer.Port, peer.Client, peer.Progress, downloaded, uploaded)
-					lastUploaded[peerID] = peer.Uploaded
-					lastDownloaded[peerID] = peer.Downloaded
-				}
-			}()
 		case <-ctx.Done():
 			log.Printf("Stopping monitor for hash: %s", hash)
 			return
 		}
 	}
+}
+
+func updatePeerMetrics(client *qbittorrent.Client, db *sql.DB, hash string, torrentID int,
+	rid *int, lastUploaded, lastDownloaded map[int]int64) error {
+
+	peers, err := client.SyncTorrentPeers(hash, *rid)
+	if err != nil {
+		return fmt.Errorf("getting peer info: %w", err)
+	}
+	*rid = peers.Rid
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("starting transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	ts := time.Now().UTC()
+	for _, peer := range peers.Peers {
+		var peerID int
+		err := tx.QueryRow(`
+            INSERT INTO peers (ip, port, client)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(ip, port) DO UPDATE SET client = excluded.client
+            RETURNING id`, peer.IP, peer.Port, peer.Client).Scan(&peerID)
+		if err != nil {
+			log.Printf("Error inserting/getting peer ID: %v", err)
+			continue
+		}
+
+		uploaded := max(0, peer.Uploaded-lastUploaded[peerID])
+		downloaded := max(0, peer.Downloaded-lastDownloaded[peerID])
+
+		_, err = tx.Exec(`
+            INSERT INTO peer_metrics (timestamp, peer_id, torrent_id, uploaded, downloaded, pct_complete)
+            VALUES ($1, $2, $3, $4, $5, $6)`,
+			ts.Format(time.RFC3339), peerID, torrentID, uploaded, downloaded, peer.Progress)
+		if err != nil {
+			log.Printf("Error inserting peer metrics: %v", err)
+			continue
+		}
+
+		log.Printf("%s peer_metrics %40s,%15s:%-5d: %20s %5.3f %12d %12d\n",
+			ts.Format(time.Stamp), hash, peer.IP, peer.Port, peer.Client, peer.Progress, downloaded, uploaded)
+		lastUploaded[peerID] = peer.Uploaded
+		lastDownloaded[peerID] = peer.Downloaded
+	}
+
+	return tx.Commit()
 }
 
 func periodicCheck(client *qbittorrent.Client, ctx context.Context, db *sql.DB, newTorrentChan <-chan TorrentNotification) {
@@ -292,7 +291,7 @@ func periodicCheck(client *qbittorrent.Client, ctx context.Context, db *sql.DB, 
 							log.Printf("Error inserting main metrics (%s): %v", hash, err)
 							continue
 						}
-						fmt.Printf("%s main_metrics %40s: %12d %12d\n", ts.Format(time.Stamp), hash, uploaded, downloaded)
+						log.Printf("%s main_metrics %40s: %12d %12d\n", ts.Format(time.Stamp), hash, uploaded, downloaded)
 
 						lastUploaded[hash] = torrent.Uploaded
 						lastDownloaded[hash] = torrent.Downloaded
@@ -312,6 +311,24 @@ func periodicCheck(client *qbittorrent.Client, ctx context.Context, db *sql.DB, 
 }
 
 func run(cmd *cobra.Command, args []string) {
+	// Set up logging
+	logPath := filepath.Join(os.Getenv("HOME"), "logs")
+	if err := os.MkdirAll(logPath, 0755); err != nil {
+		log.Fatal(err)
+	}
+
+	logFile, err := os.OpenFile(
+		filepath.Join(logPath, "swarmmonitor.log"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+		0644,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer logFile.Close()
+
+	log.SetOutput(logFile)
+
 	loadConfig(configPath) // Override defaults with config file values
 
 	qbClient, err := qbittorrent.NewClient(qBitUsername, qBitPassword, qBitAddr, qBitPort)
@@ -327,6 +344,7 @@ func run(cmd *cobra.Command, args []string) {
 
 	newTorrentChan = make(chan TorrentNotification, 10) // adjust buffer size as needed
 
+	log.Println("Starting periodic check")
 	go periodicCheck(qbClient, ctx, db, newTorrentChan)
 
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
@@ -343,7 +361,7 @@ func run(cmd *cobra.Command, args []string) {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
-	// Goroutine to accept connections, main code waits for interrupts
+	log.Printf("Listening on %s", socketPath)
 	go func() {
 		for {
 			select {
@@ -383,18 +401,18 @@ func handleConnection(ctx context.Context, conn net.Conn, qbClient *qbittorrent.
 	}
 
 	input := scanner.Text()
-	fields := strings.Fields(input)
-	if len(fields) != 2 {
-		log.Println("Expected name and hash separated by whitespace. Ignoring.")
+	fields := strings.SplitN(input, " ", 3)
+	if len(fields) < 3 {
+		log.Println("Expected hash, tracker, and name separated by whitespace. Ignoring.")
 		return
 	}
 
-	// we assume Fields can't ever return empty strings
-	name := fields[0]
-	hash := fields[1]
-	log.Printf("Received name: %s, hash: %s", name, hash)
+	hash := fields[0]
+	tracker := fields[1]
+	name := fields[2]
+	log.Printf("Received hash: %s, tracker: %s, name: %s", hash, tracker, name)
 
-	go monitorTorrent(name, hash, qbClient, ctx, db)
+	go monitorTorrent(hash, tracker, name, qbClient, ctx, db)
 }
 
 func main() {
